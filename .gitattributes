@@ -1,0 +1,9 @@
+# Normalize line endings: store text as LF in the repo (deterministic, cross-platform).
+* text=auto eol=lf
+
+# Binary files — never normalize.
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.key binary

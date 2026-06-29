@@ -1,0 +1,69 @@
+# Compiled Object files
+**/.DS_Store
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+**/cmake-build-debug
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/install_manifest.txt
+**/CMakeFiles/
+**/CTestTestfile.cmake
+**/Makefile
+**/*.cbp
+**/CMakeScripts
+**/compile_commands.json
+
+include/divisible/*
+
+
+## Local
+
+.idea/*.xml
+
+build/**/*
+
+# Local-only working notes / design docs — NEVER pushed to GitHub.
+# Contains downstream-consumer details that must stay private.
+_local/
+*.local.md
+
+# wfb-ng ground-station key — a secret; never commit. Supply at runtime.
+gs.key
+
+# vcpkg (local dependency manager bootstrapped per-clone — not project source)
+vcpkg/
+
+# build logs
+*.log
+
+include/*
+lib/*
+bin/*
+test/test_runner

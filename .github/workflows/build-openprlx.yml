@@ -1,0 +1,99 @@
+name: build-openprlx
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  BUILD_CONFIGURATION: Release
+
+permissions:
+  contents: write   # release job uploads assets
+
+jobs:
+  build:
+    # Pin to VS2022, NOT windows-latest: latest now ships VS18/MSVC 14.51 (VS2026
+    # class), which fails to build the pinned vcpkg ports (libsodium builds a
+    # vs2022 .vcxproj that doesn't compile on the v18 toolset → BUILD_FAILED). The
+    # pinned vcpkg release + ports are known-good on VS2022.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: ilammy/msvc-dev-cmd@v1.4.1
+
+      - name: Cache vcpkg/installed
+        id: cache-vcpkg
+        uses: actions/cache@v3
+        with:
+          path: vcpkg/installed
+          key: ${{ runner.os }}-vcpkg-openprlx-${{ hashFiles('vcpkg/installed/**/*') }}
+          restore-keys: ${{ runner.os }}-vcpkg-openprlx-
+
+      - name: Build openprlx
+        run: |
+          if (-Not (Test-Path -Path vcpkg )) { New-Item -ItemType Directory -Path vcpkg }
+          cd vcpkg
+          git init
+          git remote add origin https://github.com/microsoft/vcpkg.git
+          # Pin a RECENT vcpkg RELEASE tag (shallow). An old commit referenced a
+          # pkgconf package version MSYS2's mirrors no longer host (every mirror
+          # 404'd → libsodium's build BUILD_FAILED). Release tags are tested
+          # snapshots with live download URLs.
+          git fetch --depth 1 origin refs/tags/2026.06.24
+          git checkout FETCH_HEAD
+          .\bootstrap-vcpkg.bat
+          .\vcpkg integrate install
+          # GUI deps (ffmpeg/qt5/sdl2) intentionally dropped — headless build.
+          # libpcap also dropped: the ONLY pcap consumer in the vendored driver is
+          # 3rd/rtl8812au-monitor-pcap/src/main.cpp, which CMakeLists excludes from the
+          # build — and libpcap:x64-windows fails to build on the runner's toolchain,
+          # which aborted the whole install. We link libusb + sodium + ws2_32 only.
+          # Pin the x64 triplet explicitly: classic-mode `vcpkg install` with no
+          # triplet defaults to x86-windows, while the default VS generator builds
+          # x64 -> architecture/link mismatch, and the x64-windows DLL staging path
+          # below would not exist.
+          .\vcpkg install libusb:x64-windows libsodium:x64-windows
+          cd ..
+          cmake "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" -A x64 -DVCPKG_TARGET_TRIPLET=x64-windows -S ./ -B build
+          cmake --build build --config Release --target openprlx
+
+      - name: Stage dist (exe + runtime DLLs)
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # openprlx.exe lands in build/Release with the VS (MSBuild) generator.
+          $exe = Get-ChildItem -Path build -Recurse -Filter openprlx.exe | Select-Object -First 1
+          if (-not $exe) { throw 'openprlx.exe not found under build/ — the build step failed.' }
+          Copy-Item $exe.FullName dist/
+          # Bundle the dynamic vcpkg deps (libusb-1.0.dll, libsodium.dll).
+          Copy-Item vcpkg/installed/x64-windows/bin/*.dll dist/ -ErrorAction SilentlyContinue
+          # Fail loudly if the critical runtime dep didn't make it (the copy above is silent).
+          if (-not (Test-Path dist/libusb-1.0.dll)) { throw 'libusb-1.0.dll missing from dist — vcpkg triplet/staging mismatch.' }
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openprlx-win64
+          path: dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openprlx-win64
+          path: dist/
+      - name: Zip
+        run: Compress-Archive -Path dist/* -DestinationPath openprlx-win64.zip
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: openprlx-win64.zip
