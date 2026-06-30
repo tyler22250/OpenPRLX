@@ -28,8 +28,10 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <sodium.h>
 #include <string>
 #include <thread>
 #include <utility>
@@ -148,6 +150,19 @@ inline std::string jsonEscape(const std::string &s) {
     return o;
 }
 
+// Constant-time compare for the control-API token (avoids a timing side-channel on the
+// shared secret). Length is checked first (token length is not the secret); the byte
+// compare uses libsodium's constant-time sodium_memcmp.
+inline bool tokenEqual(const std::string &a, const std::string &b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    if (a.empty()) {
+        return true;
+    }
+    return sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
 } // namespace openprlx_http
 
 class ControlServer {
@@ -231,7 +246,13 @@ private:
         std::string buf;
         char tmp[2048];
         size_t hdrEnd = std::string::npos;
+        // Overall wall-clock deadline so a client dribbling bytes under the per-recv
+        // SO_RCVTIMEO can't park this (single-threaded) server for long (slowloris).
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (true) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return false;
+            }
             int n = recv(c, tmp, sizeof(tmp), 0);
             if (n <= 0) {
                 return false;
@@ -273,6 +294,9 @@ private:
             return false;
         }
         while (static_cast<int>(body.size()) < contentLength) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return false;
+            }
             int n = recv(c, tmp, sizeof(tmp), 0);
             if (n <= 0) {
                 break;
@@ -293,11 +317,11 @@ private:
         const std::string bearer = "Bearer ";
         if (auth.size() > bearer.size()
             && openprlx_http::toLower(auth.substr(0, bearer.size())) == "bearer ") {
-            if (auth.substr(bearer.size()) == token_) {
+            if (openprlx_http::tokenEqual(auth.substr(bearer.size()), token_)) {
                 return true;
             }
         }
-        return openprlx_http::queryValue(query, "token") == token_;
+        return openprlx_http::tokenEqual(openprlx_http::queryValue(query, "token"), token_);
     }
 
     void respond(SOCKET c, int code, const std::string &reason, const std::string &body,
@@ -372,29 +396,45 @@ private:
     }
 
     void handleStart(SOCKET c, const std::string &body) {
+        // Reject a busy start BEFORE touching the persisted config: a rejected request must
+        // have no side effects (it must not silently reconfigure the next session).
+        const auto s = ctx_.state.load();
+        if (s == SessionState::Starting || s == SessionState::Streaming || s == SessionState::Stopping) {
+            respond(c, 409, "Conflict", "{\"error\":\"already running\"}");
+            return;
+        }
         std::string vidpid, key;
         int channel = 0, width = 0;
         bool hasVidpid = openprlx_http::jsonFindString(body, "vidpid", vidpid);
         bool hasKey = openprlx_http::jsonFindString(body, "key", key);
         bool hasChannel = openprlx_http::jsonFindInt(body, "channel", channel);
         bool hasWidth = openprlx_http::jsonFindInt(body, "width", width);
-        ctx_.mergeSessionConfig(hasVidpid, vidpid, hasChannel, channel, hasWidth, width, hasKey, key);
-        const auto s = ctx_.state.load();
-        if (s == SessionState::Starting || s == SessionState::Streaming || s == SessionState::Stopping) {
-            respond(c, 409, "Conflict", "{\"error\":\"already running\"}");
+        if ((hasChannel && !isValidChannel(channel)) || (hasWidth && !isValidWidth(width))) {
+            respond(c, 400, "Bad Request", "{\"error\":\"channel 1..177 / width 0..2\"}");
             return;
         }
+        ctx_.mergeSessionConfig(hasVidpid, vidpid, hasChannel, channel, hasWidth, width, hasKey, key);
         ctx_.requestStart();
         respond(c, 202, "Accepted", "{\"accepted\":true,\"state\":\"starting\"}");
     }
 
     void handleTune(SOCKET c, const std::string &body) {
+        // A live retune only makes sense on an active session; staging one while not
+        // streaming would otherwise be applied to the NEXT start, overriding its channel.
+        if (ctx_.state.load() != SessionState::Streaming) {
+            respond(c, 409, "Conflict", "{\"error\":\"not streaming\"}");
+            return;
+        }
         int channel = 0, width = -1;
         if (!openprlx_http::jsonFindInt(body, "channel", channel)) {
             respond(c, 400, "Bad Request", "{\"error\":\"channel required\"}");
             return;
         }
-        openprlx_http::jsonFindInt(body, "width", width); // optional; -1 = keep
+        openprlx_http::jsonFindInt(body, "width", width); // optional; -1 = keep current
+        if (!isValidChannel(channel) || (width != -1 && !isValidWidth(width))) {
+            respond(c, 400, "Bad Request", "{\"error\":\"channel 1..177 / width 0..2\"}");
+            return;
+        }
         ctx_.requestTune(channel, width);
         respond(c, 202, "Accepted", "{\"accepted\":true}");
     }

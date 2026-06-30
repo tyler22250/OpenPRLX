@@ -35,7 +35,16 @@ public:
     std::span<uint8_t> MacDstNoncePart2() const { return { _data.data() + 17, 4 }; }
     std::span<uint8_t> MacDstRadioPort() const { return { _data.data() + 21, 1 }; }
     std::span<uint8_t> SequenceControl() const { return { _data.data() + 22, 2 }; }
-    std::span<uint8_t> PayloadSpan() const { return { _data.data() + 24, _data.size() - 28 }; }
+    // OpenPRLX divergence from upstream: guard the unsigned length math. On a 22-27 byte
+    // frame `_data.size() - 28` underflows to a huge size_t, yielding a multi-GB span whose
+    // .empty() is false (so IsValidWfbFrame would wrongly pass it). Return an empty span when
+    // the frame is too short to hold the 24-byte header + 4-byte trailer.
+    std::span<uint8_t> PayloadSpan() const {
+        if (_data.size() < 28) {
+            return {};
+        }
+        return { _data.data() + 24, _data.size() - 28 };
+    }
     std::span<uint8_t> GetNonce() const {
         std::array<uint8_t, 8> data;
         std::copy(_data.begin() + 11, _data.begin() + 15, data.begin());

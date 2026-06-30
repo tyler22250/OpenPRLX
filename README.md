@@ -9,9 +9,9 @@ RTL8812AU adapter, de-FECs and decrypts it, and forwards the raw **RTP** to a lo
 downstream app to decode and display. No GUI, no decoder, no rendering — just a robust
 receive-and-forward daemon with a localhost HTTP control/health API.
 
-> ⚠️ **Early development (v0.1.0).** The receive → decrypt → forward → control pipeline is complete
-> and has been validated on real hardware (RTL8812AU + an OpenIPC H.265 air unit). Interfaces may
-> still change.
+> ⚠️ **Early development (v0.1.1).** The receive → decrypt → forward → control pipeline is complete
+> and has been validated on real hardware (RTL8812AU + an OpenIPC H.265 air unit). v0.1.1 adds a
+> post-audit security & robustness hardening pass. Interfaces may still change.
 
 ## What it does
 
@@ -47,20 +47,26 @@ receive-and-forward daemon with a localhost HTTP control/health API.
 
 ## Build
 
-Visual Studio 2022 ("Desktop development with C++") + [vcpkg](https://github.com/microsoft/vcpkg):
+Visual Studio 2022 ("Desktop development with C++") + [vcpkg](https://github.com/microsoft/vcpkg).
+Dependencies (libusb, libsodium) are pinned in [`vcpkg.json`](vcpkg.json) and linked **statically**
+(`x64-windows-static` + static CRT), so `openprlx.exe` ships as a single self-contained binary — no
+DLLs and no VC++ redistributable required on the target.
 
 ```sh
-vcpkg install libusb:x64-windows libsodium:x64-windows
+vcpkg install libusb:x64-windows-static libsodium:x64-windows-static
 
 cmake -G "Visual Studio 17 2022" -A x64 \
       -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake \
-      -DVCPKG_TARGET_TRIPLET=x64-windows -S . -B build
+      -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_MANIFEST_MODE=OFF -S . -B build
 
 cmake --build build --config Release --target openprlx
 ```
 
-`openprlx.exe` and its runtime DLLs land in `build/Release/`. The RTL8812AU userspace driver is
-vendored under [`3rd/`](3rd/) — no submodule fetch required.
+`-DVCPKG_MANIFEST_MODE=OFF` builds against the classic-installed static deps above (this is what CI
+does); `vcpkg.json` pins the same versions for manifest-mode / CI reproducibility. A single
+self-contained `openprlx.exe` lands in `build/Release/` — verify with `dumpbin /dependents`, which
+should list only system DLLs. The RTL8812AU userspace driver is vendored under [`3rd/`](3rd/) — no
+submodule fetch required.
 
 ## Quick start
 
@@ -80,8 +86,8 @@ Point any RTP consumer at `udp://127.0.0.1:5600` (an SDP is available at `GET /s
 | Flag | Default | Meaning |
 |---|---|---|
 | `--vidpid VID:PID` | — | Adapter to open (e.g. `0bda:8812`). If omitted, daemon idles awaiting `POST /start`. |
-| `--channel N` | `161` | WiFi channel. |
-| `--width W` | `0` | Channel width ordinal: `0`=20 MHz, `1`=40 MHz. |
+| `--channel N` | `161` | WiFi channel (validated `1`–`177`). |
+| `--width W` | `0` | Channel width ordinal: `0`=20 MHz, `1`=40 MHz, `2`=80 MHz (validated `0`–`2`). |
 | `--key PATH` | `gs.key` | wfb ground-station key file. |
 | `--out-port N` | `5600` | RTP egress UDP port on `127.0.0.1`. |
 | `--health-port N` | `9301` | Control + health HTTP port on `127.0.0.1`. |
@@ -98,9 +104,9 @@ Localhost only, `127.0.0.1:<health-port>`. Every route requires the token (when 
 | Method · Path | Body | Result |
 |---|---|---|
 | `GET /health` | — | `200` status JSON: `state`, `streaming`, `captureAlive`, counters, `codec`, `rtpPayloadType`, `ssrc`, `sdpReady`, `paramSets`, `pubkey`, `port` (+`lastError` when `state=error`). |
-| `POST /start` | `{vidpid?,channel?,width?,key?}` | `202` (merges into config); `409` if already running. |
+| `POST /start` | `{vidpid?,channel?,width?,key?}` | `202` (merges into config); `409` if busy (config left **unchanged**); `400` on out-of-range `channel`/`width`. |
 | `POST /stop` | — | `202` (idempotent). |
-| `POST /tune` | `{channel, width?}` | `202` — live retune, no restart; `400` if `channel` missing. |
+| `POST /tune` | `{channel, width?}` | `202` — live retune, no restart; `409` if not streaming; `400` if `channel` is missing or `channel`/`width` out of range. |
 | `POST /key` | `{"sealed":"<base64>"}` | `202` — open sealed key + live reseed; `400` on a bad/missing seal. |
 | `GET /sdp` | — | `200 application/sdp` once the codec is detected (progressive: gains the `a=fmtp` line when parameter sets arrive); `503` before detection. |
 | `GET /pubkey` | — | `200 {"pubkey":"<base64>"}` — the daemon's X25519 public key for sealing. |

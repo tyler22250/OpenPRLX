@@ -6,6 +6,7 @@
 
 #include "basic_types.h"
 #include "rtl8812a_recv.h"
+#include <utility>
 #include <vector>
 
 FrameParser::FrameParser(Logger_t logger) : _logger{logger} {}
@@ -115,9 +116,16 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     if (pattrib.pkt_rpt_type ==
         RX_PACKET_TYPE::NORMAL_RX) /* Normal rx packet */
     {
-      ret.push_back({pattrib, pbuf.subspan(pattrib.shift_sz +
-                                               pattrib.drvinfo_sz + RXDESC_SIZE,
-                                           pattrib.pkt_len)});
+      // OpenPRLX divergence from upstream: copy the packet bytes out of the transient
+      // USB stack buffer into Packet-owned Storage (Data views it), so the payload
+      // outlives infinite_read()'s return instead of dangling into a destroyed frame.
+      auto sub = pbuf.subspan(pattrib.shift_sz + pattrib.drvinfo_sz + RXDESC_SIZE,
+                              pattrib.pkt_len);
+      Packet pkt;
+      pkt.RxAtrib = pattrib;
+      pkt.Storage.assign(sub.begin(), sub.end());
+      pkt.Data = std::span<uint8_t>{pkt.Storage};
+      ret.push_back(std::move(pkt));
       // pre_recv_entry(precvframe, pattrib.physt ? pbuf.Slice(RXDESC_OFFSET) :
       // null);
     } else {

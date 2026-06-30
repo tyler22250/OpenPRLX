@@ -85,6 +85,8 @@ bool WFBReceiver::Start(const std::string &vidPid, uint8_t channel, int channelW
     ctx_.captureFinished = false;
     ctx_.resetDetection(); // described=false, pt=-1, codec=codecHint (AUTO re-sniffs)
     ctx_.shouldStop = false;
+    ctx_.clearTune(); // drop any tune staged in a prior session so this start honors its
+                      // configured channel rather than a stale retune
 
     keyPath_ = kPath;
     int rc;
@@ -145,12 +147,17 @@ bool WFBReceiver::Start(const std::string &vidPid, uint8_t channel, int channelW
         return false;
     }
 
+    // Mark Streaming BEFORE spawning the capture thread so the thread's own terminal
+    // state writes (Error via setError, or Idle on a clean exit) always win. Writing it
+    // AFTER the spawn could clobber a fast-failed thread's terminal state, leaving
+    // state=Streaming + captureFinished=true so the supervisor (which reaps only on
+    // Idle/Error) never joins the dead thread and every later /start returns 409.
+    ctx_.state = SessionState::Streaming;
+
     usbThread_ = std::thread([this, channel, channelWidth, logger]() {
         WiFiDriver wifi_driver { logger };
         try {
             rtlDevice_ = wifi_driver.CreateRtlDevice(devHandle_);
-            // Honor a stop requested between thread spawn and device creation.
-            rtlDevice_->should_stop = ctx_.shouldStop.load();
             SelectedChannel sc {
                 .Channel = channel,
                 .ChannelOffset = 0,
@@ -167,19 +174,33 @@ bool WFBReceiver::Start(const std::string &vidPid, uint8_t channel, int channelW
             // (silence) is fine; NO_DEVICE/NOT_FOUND is fatal now, and a sustained run
             // of any other USB error trips the same fail-fast as a backstop.
             int consecutiveErrors = 0;
-            while (!rtlDevice_->should_stop) {
+            auto lastUsbErrLog = std::chrono::steady_clock::time_point {};
+            // Stop is driven by the ctx_.shouldStop atomic (set by Stop() on the
+            // supervisor thread). The capture thread owns rtlDevice_, so the supervisor
+            // must never read it; checking the atomic here also catches a stop requested
+            // during CreateRtlDevice/BringUp (the loop simply never enters).
+            while (!ctx_.shouldStop.load()) {
                 applyPendingControlActions();
                 int usb_rc = 0;
                 auto packets = rtlDevice_->ReadOnce(usb_rc);
                 if (usb_rc == LIBUSB_ERROR_NO_DEVICE || usb_rc == LIBUSB_ERROR_NOT_FOUND) {
                     throw std::runtime_error("adapter disconnected (libusb " + std::to_string(usb_rc) + ")");
                 }
-                if (usb_rc < 0 && usb_rc != LIBUSB_ERROR_TIMEOUT) {
+                if (usb_rc == LIBUSB_ERROR_TIMEOUT) {
+                    // Benign RF silence: leave the error streak unchanged. Resetting it on a
+                    // timeout would let a steady error stream interleaved with timeouts evade
+                    // the fail-fast below indefinitely.
+                } else if (usb_rc < 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - lastUsbErrLog >= std::chrono::seconds(1)) {
+                        ctx_.log("warn", "USB read error (libusb " + std::to_string(usb_rc) + ")");
+                        lastUsbErrLog = now;
+                    }
                     if (++consecutiveErrors >= 10) {
                         throw std::runtime_error("adapter read errors (libusb " + std::to_string(usb_rc) + ")");
                     }
                 } else {
-                    consecutiveErrors = 0;
+                    consecutiveErrors = 0; // a clean read clears the streak
                 }
                 for (auto &p : packets) {
                     handle80211Frame(p);
@@ -207,7 +228,6 @@ bool WFBReceiver::Start(const std::string &vidPid, uint8_t channel, int channelW
         ctx_.captureFinished = true;
     });
 
-    ctx_.state = SessionState::Streaming;
     return true;
 }
 
@@ -237,16 +257,24 @@ void WFBReceiver::applyPendingControlActions() {
     int ch = 0, w = 0;
     if (ctx_.takeTune(ch, w)) {
         ChannelWidth_t width = (w < 0) ? curWidth_ : static_cast<ChannelWidth_t>(w);
-        curChannel_ = static_cast<uint8_t>(ch);
-        curWidth_ = width;
-        // Register reprogram only — no USB re-init, no blackout on a same-codec hop.
-        rtlDevice_->SetMonitorChannel(SelectedChannel {
-            .Channel = curChannel_,
-            .ChannelOffset = 0,
-            .ChannelWidth = width,
-        });
-        ctx_.log("info", "retuned to channel " + std::to_string(ch));
-        ctx_.resetDetection(); // re-describe the (possibly different) stream
+        // The vendored driver throws std::logic_error on a bandwidth it doesn't implement;
+        // a bad tune must not fault the whole capture session (the control API validates
+        // width too — this is defense-in-depth). On failure, keep the current channel/width.
+        try {
+            // Register reprogram only — no USB re-init, no blackout on a same-codec hop.
+            rtlDevice_->SetMonitorChannel(SelectedChannel {
+                .Channel = static_cast<uint8_t>(ch),
+                .ChannelOffset = 0,
+                .ChannelWidth = width,
+            });
+            curChannel_ = static_cast<uint8_t>(ch);
+            curWidth_ = width;
+            ctx_.log("info", "retuned to channel " + std::to_string(ch));
+            ctx_.resetDetection(); // re-describe the (possibly different) stream
+        } catch (const std::exception &e) {
+            ctx_.log("warn", std::string("ignored bad tune (channel ") + std::to_string(ch) + ", width "
+                                 + std::to_string(w) + "): " + e.what());
+        }
     }
 
     // Sealed-key reseed (Step 7): drain a staged key and rebuild the Aggregator in
@@ -288,7 +316,7 @@ inline Codec sniffCodec(const uint8_t *data) {
 void WFBReceiver::handleRtp(uint8_t *payload, uint16_t packet_size) {
     // Guard before counting: a null device (pre-init) or a stopping device must not
     // tick the forwarded-packet counter that /health "streaming" is derived from.
-    if (!rtlDevice_ || rtlDevice_->should_stop) {
+    if (!rtlDevice_ || ctx_.shouldStop.load()) {
         return;
     }
     ctx_.rtpPktCount++;
@@ -303,13 +331,24 @@ void WFBReceiver::handleRtp(uint8_t *payload, uint16_t packet_size) {
 
     auto *header = (RtpHeader *)payload;
 
-    // One-shot stream description on the first RTP packet (of a session or post-retune).
-    if (!ctx_.described.exchange(true)) {
-        if (ctx_.codec.load() == Codec::Auto) {
+    // Codec sniff: on the first packet that actually carries a payload. Guarded with
+    // plen > 0 so a short or fully-header-consumed packet can't read past the payload
+    // (sniffCodec derefs data[0], and getPayloadData() can point at/after the packet
+    // end when csrc/ext eat it all) — same guard the param-set path below already uses.
+    // Decoupled from the `described` latch so a degenerate first packet can't leave the
+    // codec stuck at Auto (which would also disable SDP param-set capture) for the session.
+    if (ctx_.codec.load() == Codec::Auto) {
+        const ssize_t plen = header->getPayloadSize(packet_size);
+        if (plen > 0) {
             Codec detected = sniffCodec(header->getPayloadData());
             ctx_.codec = detected;
             ctx_.log("debug", std::string("detected codec ") + codecName(detected));
         }
+    }
+
+    // One-shot stream description (pt/ssrc/log) on the first RTP packet. Reads only the
+    // fixed 12-byte header (packet_size >= 12 already checked above), so no payload bound.
+    if (!ctx_.described.exchange(true)) {
         ctx_.rtpPayloadType = header->pt;
         ctx_.ssrc = ntohl(header->ssrc);
         ctx_.log("info",
@@ -347,9 +386,9 @@ bool WFBReceiver::Stop() {
     }
     ctx_.shouldStop = true;
     ctx_.described = false;
-    if (rtlDevice_) {
-        rtlDevice_->should_stop = true;
-    }
+    // Stop is signalled solely via the ctx_.shouldStop atomic (read at the RX-loop top).
+    // Stop() runs on the supervisor thread and MUST NOT touch rtlDevice_, which the
+    // capture thread concurrently creates/owns (reading it here was a data race / UB).
     return true;
 }
 

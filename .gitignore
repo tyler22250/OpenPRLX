@@ -47,7 +47,11 @@ include/divisible/*
 
 .idea/*.xml
 
+# Claude Code local agent state (settings, session scratch) — never pushed.
+.claude/
+
 build/**/*
+build-static/
 
 # Local-only working notes / design docs — NEVER pushed to GitHub.
 # Contains downstream-consumer details that must stay private.

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "openprlx",
+  "version-string": "0.1.1",
+  "description": "Headless wfb-ng -> RTP video forwarder for Windows",
+  "builtin-baseline": "52c9e08cdf8580d2d9762f547d22b96fd81e82f2",
+  "dependencies": [
+    "libusb",
+    "libsodium"
+  ]
+}

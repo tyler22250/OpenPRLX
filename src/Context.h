@@ -66,6 +66,13 @@ inline Codec parseCodec(const std::string &s) {
     return Codec::Auto;
 }
 
+// Shared input-range checks (used by both the CLI and the control API). Channels span the
+// 2.4GHz + 5GHz sets the driver tunes; width is the ChannelWidth_t ordinal the vendored
+// driver actually implements (20/40/80 = 0/1/2 — higher ordinals throw at tune time).
+inline bool isValidChannel(int ch) { return ch >= 1 && ch <= 177; }
+inline bool isValidWidth(int w) { return w >= 0 && w <= 2; }
+inline bool isValidPort(int p) { return p >= 1 && p <= 65535; }
+
 // Desired session config: seeded from CLI, merged by POST /start, reused on restart.
 struct SessionConfig {
     std::string vidpid;
@@ -187,6 +194,12 @@ struct OpenPrlxContext {
         channel = reqs_.pendingChannel;
         width = reqs_.pendingWidth;
         return true;
+    }
+    // Drop any staged-but-undrained tune. Called by Start() so a fresh session honors its
+    // configured channel instead of applying a tune left over from a prior Streaming window.
+    void clearTune() {
+        std::lock_guard<std::mutex> lk(sessMutex);
+        reqs_.tunePending = false;
     }
     // Sealed-key reseed (Step 7): server stages the decrypted 64-byte key; the capture
     // thread drains it and rebuilds the Aggregator. The staged copy is wiped on take.

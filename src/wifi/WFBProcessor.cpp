@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <format>
+#include <sodium.h>
 #include <stdexcept>
 #include <string>
 
@@ -35,31 +36,42 @@ using namespace std;
     } while (0)
 
 namespace {
-// Read a 64-byte wfb keypair file: [rx_secretkey(32)][tx_publickey(32)] (gs.key layout).
-// Throws the same runtime_errors as before on a missing/short file, preserving the
-// graceful session-error path. The single file-reading code path for the dev --key.
-std::array<uint8_t, 64> loadKeypairFile(const string &keypair) {
-    std::array<uint8_t, 64> kp {};
+// Read a 64-byte wfb keypair file: [rx_secretkey(32)][tx_publickey(32)] (gs.key layout)
+// into the caller-owned `out`, so the caller can wipe it and no plaintext key copy is
+// returned by value / left lingering here. Throws on a missing/short file, preserving
+// the graceful session-error path. The single file-reading code path for the dev --key.
+void loadKeypairFile(const string &keypair, std::array<uint8_t, 64> &out) {
     FILE *fp;
     if ((fp = fopen(keypair.c_str(), "rb")) == NULL) {
         throw runtime_error(format("Unable to open {}: {}", keypair.c_str(), strerror(errno)));
     }
-    if (fread(kp.data(), crypto_box_SECRETKEYBYTES, 1, fp) != 1) {
+    if (fread(out.data(), crypto_box_SECRETKEYBYTES, 1, fp) != 1) {
         fclose(fp);
         throw runtime_error(format("Unable to read rx secret key: {}", strerror(errno)));
     }
-    if (fread(kp.data() + crypto_box_SECRETKEYBYTES, crypto_box_PUBLICKEYBYTES, 1, fp) != 1) {
+    if (fread(out.data() + crypto_box_SECRETKEYBYTES, crypto_box_PUBLICKEYBYTES, 1, fp) != 1) {
         fclose(fp);
         throw runtime_error(format("Unable to read tx public key: {}", strerror(errno)));
     }
     fclose(fp);
-    return kp;
 }
 } // namespace
 
-// Path ctor: load the file then delegate to the memory ctor (one key-loading path).
+// Path ctor (dev --key file load). OpenPRLX divergence from upstream: delegate to the
+// memory ctor with a ZERO key to run all the non-key init, then load the real key into a
+// single stack copy, set the key members, and wipe that copy — so exactly one transient
+// plaintext copy of the wfb key exists and it is zeroed (the --key startup read is the
+// documented on-disk exception; its in-memory copies must still be wiped, like the sealed
+// path). A bad key file throws from this body; the already-constructed object's dtor then
+// runs and wipes the (zeroed) key members. FEC/decrypt math unchanged.
 Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id, const DataCB &cb)
-    : Aggregator(loadKeypairFile(keypair), epoch, channel_id, cb) {}
+    : Aggregator(std::array<uint8_t, 64> {}, epoch, channel_id, cb) {
+    std::array<uint8_t, 64> kp {};
+    loadKeypairFile(keypair, kp);
+    memcpy(rx_secretkey, kp.data(), crypto_box_SECRETKEYBYTES);
+    memcpy(tx_publickey, kp.data() + crypto_box_SECRETKEYBYTES, crypto_box_PUBLICKEYBYTES);
+    sodium_memzero(kp.data(), kp.size());
+}
 
 // Memory ctor: the real one. keypair = [rx_secretkey(32)][tx_publickey(32)].
 Aggregator::Aggregator(const std::array<uint8_t, 64> &keypair, uint64_t epoch, uint32_t channel_id,
@@ -90,6 +102,13 @@ Aggregator::~Aggregator() {
     if (fec_p != NULL) {
         deinit_fec();
     }
+    // OpenPRLX divergence from upstream: wipe the wfb key material before the object is
+    // freed. The Aggregator is destroyed+rebuilt on every retune/reseed/stop, so without
+    // this the long-term rx secret key and the live session key would linger in freed
+    // (pageable) heap — defeating the daemon's "key is always zeroed" guarantee.
+    sodium_memzero(rx_secretkey, sizeof(rx_secretkey));
+    sodium_memzero(tx_publickey, sizeof(tx_publickey));
+    sodium_memzero(session_key, sizeof(session_key));
 }
 
 void Aggregator::init_fec(int k, int n) {
@@ -118,12 +137,15 @@ void Aggregator::init_fec(int k, int n) {
 
 void Aggregator::deinit_fec(void) {
 
+    // OpenPRLX divergence from upstream: free array-new allocations (init_fec uses
+    // new uint8_t[...] and new uint8_t*[...]) with delete[], not scalar delete. The
+    // mismatch is undefined behavior, hit on every FEC re-init / Aggregator teardown.
     for (int ring_idx = 0; ring_idx < RX_RING_SIZE; ring_idx++) {
-        delete rx_ring[ring_idx].fragment_map;
+        delete[] rx_ring[ring_idx].fragment_map;
         for (int i = 0; i < fec_n; i++) {
-            delete rx_ring[ring_idx].fragments[i];
+            delete[] rx_ring[ring_idx].fragments[i];
         }
-        delete rx_ring[ring_idx].fragments;
+        delete[] rx_ring[ring_idx].fragments;
     }
 
     fec_free(fec_p);

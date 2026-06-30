@@ -62,7 +62,8 @@ void usage() {
                  "\n"
                  "  With --vidpid the capture session auto-starts; without it the daemon idles\n"
                  "  awaiting POST /start. --control-token (or env OPENPRLX_CONTROL_TOKEN) guards\n"
-                 "  the control API. --width is the ChannelWidth_t ordinal (0 = 20MHz, 1 = 40MHz).\n";
+                 "  the control API. Ranges: --channel 1..177, --width 0..2 (0=20/1=40/2=80MHz),\n"
+                 "  --out-port / --health-port 1..65535.\n";
 }
 
 } // namespace
@@ -137,6 +138,26 @@ int main(int argc, char **argv) {
         healthPort = std::stoi(argVal(argc, argv, "--health-port", "9301"));
     } catch (const std::exception &e) {
         std::cerr << "[error] bad numeric argument: " << e.what() << std::endl;
+        usage();
+        return 2;
+    }
+    if (!isValidChannel(channel)) {
+        std::cerr << "[error] --channel out of range (1..177): " << channel << std::endl;
+        usage();
+        return 2;
+    }
+    if (!isValidWidth(width)) {
+        std::cerr << "[error] --width out of range (0=20MHz, 1=40MHz, 2=80MHz): " << width << std::endl;
+        usage();
+        return 2;
+    }
+    if (!isValidPort(outPort) || !isValidPort(healthPort)) {
+        std::cerr << "[error] --out-port / --health-port must be 1..65535" << std::endl;
+        usage();
+        return 2;
+    }
+    if (outPort == healthPort) {
+        std::cerr << "[error] --out-port and --health-port must differ (" << outPort << ")" << std::endl;
         usage();
         return 2;
     }

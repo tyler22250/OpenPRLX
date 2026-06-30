@@ -37,9 +37,22 @@ struct rx_pkt_attrib {
   RX_PACKET_TYPE pkt_rpt_type;
 };
 
+// OpenPRLX divergence from upstream: Packet now OWNS its payload bytes in `Storage`, and
+// `Data` is a span viewing that owned buffer. Upstream returned `Data` as a span into
+// infinite_read()'s local stack buffer, which dangled the instant ReadOnce() returned —
+// a use-after-return over attacker-controlled RF bytes. Move-only so the span can never be
+// silently invalidated by a copy; vector move preserves Storage's buffer address, so Data
+// stays valid across the function return and any std::vector<Packet> reallocation.
 struct Packet {
   rx_pkt_attrib RxAtrib;
+  std::vector<uint8_t> Storage;
   std::span<uint8_t> Data;
+
+  Packet() = default;
+  Packet(Packet &&) = default;
+  Packet &operator=(Packet &&) = default;
+  Packet(const Packet &) = delete;
+  Packet &operator=(const Packet &) = delete;
 };
 
 class FrameParser {

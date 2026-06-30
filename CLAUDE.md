@@ -6,8 +6,9 @@ de-FECs (zfec) + decrypts (libsodium), and forwards raw **RTP → `udp:127.0.0.1
 separate downstream consumer app to decode/render. Exposes a localhost, token-auth HTTP
 control/health API. **Non-goals:** no GUI, no decoder, no rendering. Fork of OpenIPC/fpv4win.
 
-Current release: **v0.1.0** — the full capture → decrypt → forward → control pipeline is done and
-hardware-validated (RTL8812AU `0bda:8812` + an OpenIPC H.265 air unit). See the README for user docs.
+Current release: **v0.1.1** — the full capture → decrypt → forward → control pipeline is done and
+hardware-validated (RTL8812AU `0bda:8812` + an OpenIPC H.265 air unit); v0.1.1 adds the post-audit
+security & robustness hardening pass. See the README for user docs.
 
 ## Architecture
 
@@ -37,26 +38,34 @@ the session, not the process:** a capture fault sets `state=error` + `lastError`
 - `src/Sdp.{h,cpp}` — RTP parameter-set extraction (H.264 STAP-A / H.265 AP) + SDP builder.
 - `src/KeyVault.{h,cpp}` — daemon X25519 keypair; opens libsodium-sealed keys in locked memory.
 - `src/wifi/WFBReceiver.{h,cpp}` — libusb bring-up, the owned RX loop, 802.11→wfb→RTP egress, codec sniff.
-- `src/wifi/WFBProcessor.{h,cpp}` — the wfb `Aggregator` (FEC + decrypt). **Keep the crypto/FEC math verbatim.**
-- `src/wifi/{Rtp.h,RxFrame.h,WFBDefine.h}`, `src/wifi/fec.{c,h}` — wire formats + zfec. Verbatim.
+- `src/wifi/WFBProcessor.{h,cpp}` — the wfb `Aggregator` (FEC + decrypt). **Keep the crypto/FEC math verbatim**
+  (we added only a `delete[]` fix + a key-zeroing dtor, marked `// OpenPRLX divergence from upstream:`).
+- `src/wifi/{Rtp.h,RxFrame.h,WFBDefine.h}`, `src/wifi/fec.{c,h}` — wire formats + zfec. Verbatim except a
+  `RxFrame::PayloadSpan()` short-frame underflow guard (divergence-commented).
 - `3rd/rtl8812au-monitor-pcap/` — vendored userspace driver (devourer). **Edit minimally** (we added
   `BringUp`/`ReadOnce(int&usb_rc)` accessors + a `usb_rc` out-param on `infinite_read` + made `logger.h`
-  callback-only). GPL-2.0-only — this is why the whole project is GPL-2.0.
-- `CMakeLists.txt`, `fork_compat.h` (MSVC `/FI` chrono shim), `.github/workflows/build-openprlx.yml` (CI).
+  callback-only; and made `FrameParser`'s `Packet` OWN its bytes to fix a use-after-return — all
+  `// OpenPRLX divergence from upstream:` commented). GPL-2.0-only — this is why the whole project is GPL-2.0.
+- `CMakeLists.txt`, `vcpkg.json` (pinned static deps), `fork_compat.h` (MSVC `/FI` chrono shim),
+  `.github/workflows/build-openprlx.yml` (CI).
 
 ## Build
 
-VS2022 ("Desktop development with C++") + vcpkg. Local recipe:
+VS2022 ("Desktop development with C++") + vcpkg. Deps (libusb, libsodium) are pinned in `vcpkg.json`
+and linked **statically** (`x64-windows-static` + static CRT) → `openprlx.exe` is a single
+self-contained binary, no DLLs / no VC++ redist. Local recipe:
 ```sh
-vcpkg install libusb:x64-windows libsodium:x64-windows
+vcpkg install libusb:x64-windows-static libsodium:x64-windows-static
 cmake -G "Visual Studio 17 2022" -A x64 \
       -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake \
-      -DVCPKG_TARGET_TRIPLET=x64-windows -S . -B build
+      -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_MANIFEST_MODE=OFF -S . -B build
 cmake --build build --config Release --target openprlx
 ```
-The VS-bundled cmake works too:
+`-DVCPKG_MANIFEST_MODE=OFF` uses the classic-installed static deps above (matches CI); `vcpkg.json` pins
+the same versions for manifest-mode/CI reproducibility. The VS-bundled cmake works too:
 `"C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"`.
-Output + DLLs land in `build/Release/`. After editing `CMakeLists.txt`, cmake reconfigures automatically.
+A single self-contained `openprlx.exe` lands in `build/Release/` (verify with `dumpbin /dependents` →
+system DLLs only). After editing `CMakeLists.txt`, cmake reconfigures automatically.
 
 ## Run / hardware test
 
