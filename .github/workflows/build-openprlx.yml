@@ -61,7 +61,11 @@ jobs:
           # with no triplet defaults to x86-windows, while the default VS generator builds
           # x64 -> architecture/link mismatch. The static triplet links libusb/libsodium
           # statically so the published exe ships as a single self-contained binary.
-          .\vcpkg install libusb:x64-windows-static libsodium:x64-windows-static
+          # --classic is REQUIRED: vcpkg walks parent dirs for a vcpkg.json, finds the repo
+          # root manifest, and would switch to manifest mode (which rejects package args:
+          # "In manifest mode, vcpkg install does not support individual package arguments").
+          # CI installs classically + pins via the tag; vcpkg.json is for local manifest builds.
+          .\vcpkg install libusb:x64-windows-static libsodium:x64-windows-static --classic
           cd ..
           # VCPKG_MANIFEST_MODE=OFF: use the classic-installed packages above. vcpkg.json
           # (manifest mode) is for local/dev reproducible builds; CI pins via the tag.
